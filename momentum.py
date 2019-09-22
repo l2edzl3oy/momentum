@@ -2,9 +2,11 @@ import json
 import requests
 import time
 import math
+import pandas.plotting
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors
 
 
 def init_config(config_file_path="config.json"):
@@ -19,7 +21,24 @@ def download_data(base_url, symbol, api_key, file_path):
         print("Downloaded '{}' to '{}'.".format(symbol, file_path))
 
 
-def calculate_upr(df, symbol):
+def add_ewm(df, symbol):
+    """
+    If there are missing "close" values, EWM will just copy the previous EWM value.
+
+    :param df:
+    :param symbol:
+    :return:
+    """
+    print("Adding 48w and 12w EWM for '{}'...".format(symbol))
+    col_name = "{}_close".format(symbol)
+    close_ewm_48w = df[col_name].ewm(span=48, min_periods=48).mean()
+    close_ewm_12w = df[col_name].ewm(span=12, min_periods=12).mean()
+    df["{}_ewm_48w".format(symbol)] = close_ewm_48w
+    df["{}_ewm_12w".format(symbol)] = close_ewm_12w
+    return df
+
+
+def add_upr(df, symbol):
     """
     Upside Potential Ratio.
 
@@ -27,9 +46,12 @@ def calculate_upr(df, symbol):
     :param symbol:
     :return:
     """
+    print("Adding UPR for '{}'...".format(symbol))
 
-    valid_index_start = df["{}_open".format(symbol)].first_valid_index()
-    valid_index_end = df["{}_open".format(symbol)].last_valid_index()
+    valid_index_start = max(df["{}_open".format(symbol)].first_valid_index(),
+                            df["{}_close".format(symbol)].first_valid_index())
+    valid_index_end = min(df["{}_open".format(symbol)].last_valid_index(),
+                          df["{}_close".format(symbol)].last_valid_index())
     lookback_wks = 12
 
     for i in range(valid_index_start + lookback_wks, valid_index_end + 2):
@@ -48,8 +70,9 @@ def calculate_upr(df, symbol):
         ret_sort["return_neg_sq"] = ret_sort["return_neg"] ** 2
         downside = ret_sort["return_neg_sq"].mean()
         downside = downside ** (1 / 2)
-        if downside == 0:
-            downside = df["{}_upr".format(symbol)].min()
+        if downside <= 0:
+            downside = 0.1
+            print("Replaced '0' downside with '{}' for {}.".format(0.1, symbol))
 
         upr = min(upside / downside, 3)
 
@@ -58,10 +81,74 @@ def calculate_upr(df, symbol):
     return df
 
 
+def add_signal(df, symbol):
+    print("Adding signal for '{}'...".format(symbol))
+
+    df_upr = df["{}_upr".format(symbol)]
+
+    total_upr_len = len(df_upr[df_upr >= -1])
+    threshold_upr_len = len(df_upr[df_upr >= 1])
+    print("UPR >= 1: {0:.2f}%".format(threshold_upr_len / total_upr_len * 100))
+
+    upr_mean = df_upr.mean()
+    print("Mean: {0:.4f}".format(upr_mean))
+
+    upr_median = df_upr.median()
+    print("Median: {0:.4f}".format(upr_median))
+
+    upr_quantiles = df_upr.quantile(np.arange(0, 1.01, 0.25))
+    print("UPR quantiles:\n{}".format(upr_quantiles))
+
+    start_i = df["{}_ewm_48w".format(symbol)].first_valid_index()
+    end_i = df["{}_ewm_48w".format(symbol)].last_valid_index()
+
+    for i in range(start_i, end_i + 1):
+        upr = df_upr.loc[i]
+        ewm_12w = df["{}_ewm_12w".format(symbol)].loc[i]
+        ewm_48w = df["{}_ewm_48w".format(symbol)].loc[i]
+
+        if pd.isna(upr) or pd.isna(ewm_12w) or pd.isna(ewm_48w):
+            print("Invalid values at index '{}' for '{}'. "
+                  "upr: {}. ewm_12w: {}. ewm_48w: {}.".format(i, symbol, upr, ewm_12w, ewm_48w))
+            df.at[i, "{}_signal".format(symbol)] = math.nan
+        else:
+            if upr <= upr_quantiles.iloc[1] and ewm_12w <= ewm_48w:
+                diff_series = df_upr.loc[i - 3:i]
+                if diff_series.isna().values.any():
+                    print("Invalid values at index '{}' for '{}'. diff_series: {}.".format(i, symbol, diff_series))
+                    df.at[i, "{}_signal".format(symbol)] = math.nan
+                else:
+                    diff_series_below_days = len(diff_series[diff_series <= upr_quantiles.iloc[1]]) / 4 * 100
+                    upr_mean_1 = df_upr.loc[i - 3:i - 2].mean()
+                    upr_mean_2 = df_upr.loc[i - 1:i].mean()
+                    if diff_series_below_days >= 100.0 and (upr_mean_1 >= upr_mean_2):
+                        df.at[i, "{}_signal".format(symbol)] = -1
+                    else:
+                        df.at[i, "{}_signal".format(symbol)] = -0.5
+            elif upr >= upr_quantiles.iloc[3] and ewm_12w >= ewm_48w:
+                diff_series = df_upr.loc[i - 3:i]
+                if diff_series.isna().values.any():
+                    print("Invalid values at index '{}' for '{}'. diff_series: {}.".format(i, symbol, diff_series))
+                    df.at[i, "{}_signal".format(symbol)] = math.nan
+                else:
+                    diff_series_above_days = len(diff_series[diff_series >= upr_quantiles.iloc[3]]) / 4 * 100
+                    upr_mean_1 = df_upr.loc[i - 3:i - 2].mean()
+                    upr_mean_2 = df_upr.loc[i - 1:i].mean()
+                    if diff_series_above_days >= 100.0 and (upr_mean_1 <= upr_mean_2):
+                        df.at[i, "{}_signal".format(symbol)] = 1
+                    else:
+                        df.at[i, "{}_signal".format(symbol)] = 0.5
+            else:
+                df.at[i, "{}_signal".format(symbol)] = 0
+
+    return df
+
+
 def colour_upr(df, symbols):
     plt.close("all")
 
     line_cmap = plt.get_cmap('RdYlGn', 1024)
+    light_grey = matplotlib.colors.to_rgba("lightgrey")
 
     fig, axs = plt.subplots(2, 1)
     fig.set_figwidth(25)
@@ -86,7 +173,10 @@ def colour_upr(df, symbols):
         comp_list_sorted_idx = np.argsort(comp_list).tolist()
         # print(comp_list, comp_list_sorted_idx)
         for k, _ in enumerate(data):
-            colours[k].append(line_cmap(colour_range[comp_list_sorted_idx.index(k)]))
+            if math.isnan(data[k][i]):
+                colours[k].append(light_grey)
+            else:
+                colours[k].append(line_cmap(colour_range[comp_list_sorted_idx.index(k)]))
 
     columns = df["timestamp"].iloc[df_len - 24:].dt.date.tolist()
 
@@ -105,55 +195,71 @@ def colour_upr(df, symbols):
 
     plt.tight_layout()
 
-    # plt.subplots_adjust(left=0.1)
-
     # plt.show()
-    plt.savefig("data/df.png")
+    plt.savefig("data/joined_df.png")
 
 
 if __name__ == "__main__":
+    pandas.plotting.register_matplotlib_converters()
+
     config = init_config()
     print("Loaded config: {}".format(config))
 
-    df = None
+    joined_df = None
 
-    for symbol in config["symbols"]:
-        print("Downloading {} of {}: {}...".format(config["symbols"].index(symbol) + 1, len(config["symbols"]), symbol))
-        file_path = "data/{}.csv".format(symbol.replace(".", "_"))
-
+    for config_symbol in config["symbols"]:
+        print("-----'{}' start-----".format(config_symbol))
+        config_file_path = "data/{}.csv".format(config_symbol.replace(".", "_"))
         start_time = time.time()
-        # download_data(config["base_url"], symbol, config["api_key"], file_path)
 
-        print("Pre-processing '{}'...".format(symbol))
-        temp_df = pd.read_csv(file_path)
-        # Remove zeros.
-        temp_df = temp_df[(temp_df["open"] > 0.0) & (temp_df["close"] > 0.0)]
-        # Drop unnecessary columns.
+        if config["download_data"]:
+            print("Downloading {} of {}: {}...".format(config["symbols"].index(config_symbol) + 1,
+                                                       len(config["symbols"]), config_symbol))
+            download_data(config["base_url"], config_symbol, config["api_key"], config_file_path)
+
+        print("Pre-processing '{}'...".format(config_symbol))
+        temp_df = pd.read_csv(config_file_path)
+
+        # Drop unnecessary columns. Pre-pend symbol in col name.
         temp_df = temp_df.drop(columns=["high", "low", "volume"])
-        col_names = ["{}_{}".format(symbol, col_name) for col_name in temp_df.columns if col_name != "timestamp"]
+        col_names = ["{}_{}".format(config_symbol, col_name) for col_name in temp_df.columns if col_name != "timestamp"]
         col_names.insert(0, "timestamp")
         temp_df.columns = col_names
 
-        if df is None:
-            df = temp_df
+        # Reverse so that past -> present time.
+        temp_df = temp_df[::-1].reset_index(drop=True)
+
+        # Remove zeros.
+        open_col_name = "{}_open".format(config_symbol)
+        temp_df.loc[temp_df[open_col_name] == 0, open_col_name] = math.nan
+        close_col_name = "{}_close".format(config_symbol)
+        temp_df.loc[temp_df[close_col_name] == 0, close_col_name] = math.nan
+
+        # Add statistics.
+        temp_df = add_ewm(temp_df, config_symbol)
+        temp_df = add_upr(temp_df, config_symbol)
+        temp_df = add_signal(temp_df, config_symbol)
+
+        if joined_df is None:
+            joined_df = temp_df
         else:
-            df = df.join(temp_df.set_index("timestamp"), on="timestamp", how='outer')
-        print("Pre-processed '{}'.".format(symbol))
+            joined_df = joined_df.join(temp_df.set_index("timestamp"), on="timestamp", how='outer')
+        print("Pre-processed '{}'.".format(config_symbol))
 
         elapsed_time = time.time() - start_time
-        if elapsed_time < 11:
+
+        if config["download_data"] and elapsed_time < 11:
             time_to_sleep = math.ceil(11 - elapsed_time)
             print("Rate-limiting. '{}' sec sleep...".format(time_to_sleep))
-            # time.sleep(time_to_sleep)
+            time.sleep(time_to_sleep)
 
-    df = df.dropna()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values(by=["timestamp"])
-    df = df.reset_index(drop=True)
+        print("-----'{}' end-----".format(config_symbol))
 
-    for symbol in config["symbols"]:
-        df = calculate_upr(df, symbol)
+    joined_df["timestamp"] = pd.to_datetime(joined_df["timestamp"])
+    joined_df = joined_df.sort_values(by=["timestamp"])
+    joined_df = joined_df.reset_index(drop=True)
 
-    df.to_csv("data/df.csv")
+    colour_upr(joined_df, config["symbols"])
 
-    colour_upr(df, config["symbols"])
+    joined_df.to_csv("data/joined_df.csv")
+    print("Saved CSV.")
